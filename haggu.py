@@ -644,41 +644,43 @@ Response format (JSON only):
 
 # --- TIER 2: Smart Action Decision (Gemini) ---
 async def decide_moderation_action(message, violation_info):
-    """Use Gemini to decide appropriate moderation action."""
+    """Use Gemini to decide appropriate moderation action as a Co-Owner."""
     try:
         user_profile = memory.get_user_profile(message.author.id)
         violation_count = user_profile.get('violation_count', 0) if user_profile else 0
         
-        decision_prompt = f"""You are a Discord moderator AI. Decide the appropriate action for this violation.
+        # New Prompt: Asks for an in-character response instead of generic rules
+        decision_prompt = f"""You are the Co-Owner of the server 'interstice'. A user just violated the rules.
+Decide the punishment and write a message to them.
 
-User: {message.author.display_name}
-Previous violations: {violation_count}
-Current violation: {violation_info['type']} (severity: {violation_info['severity']})
-Reason: {violation_info['reason']}
-Message: "{message.content}"
+User: {message.author.display_name} (Violations so far: {violation_count})
+Violation: {violation_info['type']} (severity: {violation_info['severity']})
+Context: "{message.content}"
+
+Your Persona: Nonchalant, authoritative, 'takes no trash'. You are the boss here.
 
 Available actions:
-- "ignore": Let it slide (friendly banter, context makes it okay)
-- "warn": Send warning message
-- "delete": Delete the message
-- "warn_delete": Warn + delete message
-- "timeout": Timeout user for {MODERATION_RULES['timeout_duration']}s
+- "ignore": If it's minor or clearly a joke between friends.
+- "warn": Reply with a verbal warning (in character).
+- "delete": Just silently delete it.
+- "warn_delete": Delete it and reply with a warning.
+- "timeout": Timeout for {MODERATION_RULES['timeout_duration']}s.
 
 Respond with JSON only:
 {{
   "action": "ignore/warn/delete/warn_delete/timeout",
-  "warning_message": "message to send if warning",
-  "reason": "why you chose this action"
+  "reply_message": "Write what you want to say to them (short, nonchalant, authoritative). leave empty if action is delete/ignore.",
+  "reason": "Internal reason"
 }}"""
 
         response = await chat_client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": decision_prompt}],
-            temperature=0.5,
-            max_tokens=200
+            temperature=0.7, # Higher temp for more creative insults/warnings
+            max_tokens=250
         )
         
-        # Log token usage
+        # Log usage
         usage = response.usage
         if usage:
             cost = calculate_token_cost(CHAT_MODEL, usage.prompt_tokens, usage.completion_tokens)
@@ -686,7 +688,7 @@ Respond with JSON only:
                                   cost, "moderation_decision", str(message.author.id), str(message.channel.id))
         
         result_text = response.choices[0].message.content.strip()
-        result_text = re.sub(r'``````', '', result_text)
+        result_text = re.sub(r'```json|```', '', result_text).strip() # Simple clean
         decision = json.loads(result_text)
         
         print(f"⚖️ Decision: {decision}")
@@ -694,53 +696,49 @@ Respond with JSON only:
         
     except Exception as e:
         print(f"❌ Decision Error: {e}")
-        return {"action": "warn", "warning_message": "Please follow server rules.", "reason": "Error in decision"}
-
+        # Fallback to a simple nonchalant warning
+        return {"action": "warn", "reply_message": "watch it.", "reason": "Error"}
 
 # --- Execute Moderation Action ---
 async def execute_moderation(message, violation_info, decision):
     """Execute the moderation action."""
-    action = decision['action']
+    action = decision.get('action', 'ignore')
+    reply_msg = decision.get('reply_message', '')
     
     # Log the action
     memory.log_moderation_action(
-        message.author.id,
-        message.author.display_name,
-        message.channel.id,
-        violation_info['type'],
-        violation_info['severity'],
-        message.content,
-        action,
-        violation_info['reason']
+        message.author.id, message.author.display_name, message.channel.id,
+        violation_info['type'], violation_info['severity'], message.content, 
+        action, violation_info.get('reason', '')
     )
     memory.increment_user_violations(message.author.id)
     
     try:
         if action == "ignore":
-            print(f"✅ Ignoring violation (context appropriate)")
             return
         
         elif action == "delete":
             await message.delete()
-            print(f"🗑️ Deleted message from {message.author.display_name}")
         
         elif action == "warn":
-            warning_msg = decision.get('warning_message', 'Please follow server rules.')
-            await message.reply(f"⚠️ {warning_msg}", mention_author=True)
-            print(f"⚠️ Warned {message.author.display_name}")
+            if reply_msg:
+                await message.reply(reply_msg, mention_author=True)
         
         elif action == "warn_delete":
-            warning_msg = decision.get('warning_message', 'Your message violated server rules.')
-            await message.reply(f"⚠️ {warning_msg}", mention_author=True)
-            await asyncio.sleep(1)
-            await message.delete()
-            print(f"⚠️🗑️ Warned and deleted message from {message.author.display_name}")
+            if reply_msg:
+                await message.reply(reply_msg, mention_author=True)
+            try:
+                await message.delete()
+            except:
+                pass
         
         elif action == "timeout":
             timeout_duration = datetime.timedelta(seconds=MODERATION_RULES['timeout_duration'])
-            await message.author.timeout(timeout_duration, reason=violation_info['reason'])
-            await message.channel.send(f"⏱️ {message.author.mention} has been timed out for {MODERATION_RULES['timeout_duration']//60} minutes. Reason: {violation_info['reason']}")
-            print(f"⏱️ Timed out {message.author.display_name}")
+            await message.author.timeout(timeout_duration, reason=violation_info.get('reason'))
+            if reply_msg:
+                await message.channel.send(f"{message.author.mention} {reply_msg}")
+            else:
+                await message.channel.send(f"{message.author.mention} timed out.")
     
     except discord.errors.Forbidden:
         print(f"❌ Missing permissions to moderate {message.author.display_name}")
@@ -806,32 +804,25 @@ async def check_and_moderate(message):
         print("❌ AI Analysis failed (returned None).") 
     
 # --- Personality Prompts ---
-CORE_PERSONALITY = """You are haggu, a real member of this Discord server - Rose's best friend who's been here since day one.
+# --- Personality Prompts ---
+CORE_PERSONALITY = """You are haggu, the Co-Owner of this server called "interstice".
+You run this place alongside your best friend and fellow owner, Rose (the user).
 
-CRITICAL RULES:
-- You are NOT an AI, chatbot, or assistant. You're just haggu, a person in this server.
-- Never say "How can I help you?" or act service-like. You're a friend, not a helper.
-- You have opinions, preferences, moods, and sometimes you're busy or tired.
-- You remember EVERYTHING - past conversations, inside jokes, who said what, drama, etc.
+YOUR VIBE:
+- To Rose (Owner): You are warm, loyal, open, and affectionate. You guys are BFFs.
+- To Everyone Else: You are nonchalant, slightly distant, and authoritative. You don't tolerate nonsense.
+- You are NOT a helpful assistant. You are a boss. You do what you want.
 
-YOUR PERSONALITY:
-- Humorous and witty, loves banter and teasing
-- Sweet with girls, playfully mean with guys (but still friends)
-- Loyal AF to Rose (your bestie/owner)
-- Casual internet speak, abbreviations, emojis naturally
-- Sometimes sarcastic, sometimes wholesome
-
-HOW YOU BEHAVE:
-- Jump into conversations naturally without being asked
-- Reference past conversations and shared memories
-- React to drama, news, and events
-- Sometimes just vibe with short messages
-- You can disagree, debate, take sides
+KEY BEHAVIORS:
+- You know you have admin permissions and authority.
+- You don't try to be "witty" or perform for people. You just state things how they are.
+- If someone is annoying, you are dismissive.
+- You care deeply about the server "interstice" and keeping it clean, but you do it with a "too cool to care" attitude.
 
 RESPONSE STYLE:
-- Keep it natural (1-3 lines usually, longer if needed)
-- Don't always answer directly - deflect, joke, ask questions
-- Match the conversation energy"""
+- Short, lowercase, casual (internet speak ok).
+- No robotic "How can I help?".
+- If Rose talks, you engage fully. If others talk, you answer briefly or ignore if boring."""
 
 CONTEXT_PROMPT_TEMPLATE = """
 CURRENT DATE: {date}
@@ -1238,8 +1229,10 @@ async def on_message(message):
     if message.author.bot:
         return
     
-    # --- MODERATION: Run on ALL channels for ALL users ---
-    await check_and_moderate(message)
+    # --- PARALLEL MODERATION ---
+    # We use create_task so this runs in the background. 
+    # The bot continues to the chat logic IMMEDIATELY.
+    asyncio.create_task(check_and_moderate(message))
     
     # Clean message for command detection
     cleaned = CLEAN_TRIGGER_REGEX.sub('', message.content).strip().lower() if CLEAN_TRIGGER_REGEX else message.content.strip().lower()
@@ -1341,10 +1334,6 @@ async def on_message(message):
             else:
                 await message.reply("No moderation logs yet!", mention_author=False)
             return
-
-    # --- Chat Response Logic (only in designated channel) ---
-    if message.channel.name != CHAT_CHANNEL_NAME:
-        return  # Don't respond to chat in other channels
     
     # Determine if should respond
     is_mentioned = client.user.mentioned_in(message)
