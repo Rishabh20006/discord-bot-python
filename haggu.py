@@ -21,7 +21,8 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 ACTIVE_CHANNEL_NAME = "rose-glazer"
 OWNER_USERNAME = "rosehumai"
-MODEL_NAME = "google/gemini-3-flash-preview"
+# MODEL_NAME = "google/gemini-3-flash-preview"
+MODEL_NAME = "deepseek/deepseek-r1-distill-llama-70b"
 BOT_NAME = "haggu"
 
 # Token pricing (per million tokens) - Update these based on current OpenRouter pricing
