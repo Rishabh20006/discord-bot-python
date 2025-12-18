@@ -1202,44 +1202,149 @@ async def on_ready():
     print(f'🎭 Mode: {"Community" if community_mode_active else "Personal (owner only)"}')
     print(f'🛡️ Moderation: Active in ALL channels')
 
+# --- HELPER FUNCTIONS (Paste these BEFORE @client.event) ---
+
+# =========================================================
+# HELPER FUNCTIONS (Place these BEFORE @client.event)
+# =========================================================
+
+async def get_owner_intent(message_content):
+    """
+    Asks Llama: 'Is this a moderation command?'
+    Returns JSON: {"is_cmd": true/false, "action": "...", "target": "..."}
+    """
+    try:
+        router_prompt = f"""
+        Analyze this input from the bot owner.
+        Input: "{message_content}"
+        
+        Is this a command to moderate a user (mute, unmute, ban, kick)?
+        Output ONLY JSON. No markdown.
+        
+        Format:
+        {{
+            "is_cmd": true,
+            "action": "mute" or "unmute" or "ban" or "kick",
+            "target": "name or mention",
+            "reason": "optional reason"
+        }}
+        
+        If it's just chat, output: {{"is_cmd": false}}
+        """
+
+        response = await detector_client.chat.completions.create(
+            model=DETECTOR_MODEL,
+            messages=[{"role": "user", "content": router_prompt}],
+            temperature=0.1,
+            max_tokens=150
+        )
+
+        # Robust JSON Cleaning
+        text = response.choices[0].message.content.strip()
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL) # Remove think tags
+        text = text.replace('```json', '').replace('```', '').strip()
+        
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
+        return {"is_cmd": False}
+
+    except Exception as e:
+        print(f"Router Error: {e}")
+        return {"is_cmd": False}
+
+async def process_owner_command_background(message):
+    """
+    Runs SILENTLY in the background.
+    Checks intent -> Executes Discord Action -> Logs to console.
+    """
+    try:
+        # 1. Ask Llama (Does not block main chat)
+        intent = await get_owner_intent(message.content)
+        
+        if not intent.get("is_cmd"):
+            return # It was just chat
+
+        # 2. Parse Action
+        action = intent.get("action")
+        target_name = intent.get("target")
+        
+        # 3. Find User
+        target_member = None
+        if message.mentions:
+            target_member = message.mentions[0]
+        elif target_name:
+            target_member = discord.utils.find(
+                lambda m: target_name.lower() in m.name.lower() or target_name.lower() in m.display_name.lower(), 
+                message.guild.members
+            )
+        
+        if not target_member:
+            print(f"⚠️ Background Cmd Failed: Could not find user '{target_name}'")
+            return
+
+        # 4. Execute (Fire and Forget)
+        print(f"⚙️ Executing {action} on {target_member.display_name}...")
+        
+        if action == "unmute":
+            await target_member.timeout(None)
+        elif action == "mute":
+            # Default 10 mins
+            await target_member.timeout(datetime.timedelta(minutes=10))
+        elif action == "ban":
+            await target_member.ban(reason="Owner command")
+        elif action == "kick":
+            await target_member.kick(reason="Owner command")
+
+    except Exception as e:
+        print(f"❌ Background Task Error: {e}")
+
+
+# =========================================================
+# MAIN EVENT HANDLER
+# =========================================================
 
 @client.event
 async def on_message(message):
     global community_mode_active, message_count_since_summary
 
-    # Ignore own messages
     if message.author == client.user:
         return
     
-    # Check if it's a text channel
     if not hasattr(message.channel, 'name'):
         return
     
-    # --- ALWAYS store message and update profile ---
+    # --- SETUP & ID CHECK ---
+    # We use your specific ID to ensure only YOU bypass checks
+    is_owner = (message.author.id == 1170042353831120956)
+    
     memory.store_message(message)
-    is_owner = message.author.name == OWNER_USERNAME
     memory.update_user_profile(message.author, is_owner=is_owner)
     message_count_since_summary += 1
     
-    # Periodically summarize (only in chat channel)
+    # Auto-Summarizer (Chat channel only)
     if message.channel.name == CHAT_CHANNEL_NAME and message_count_since_summary >= SUMMARY_THRESHOLD:
         asyncio.create_task(summarize_recent_conversation(message.channel.id))
     
-    # Skip bot messages
     if message.author.bot:
         return
     
-    # --- PARALLEL MODERATION ---
-    # We use create_task so this runs in the background. 
-    # The bot continues to the chat logic IMMEDIATELY.
-    asyncio.create_task(check_and_moderate(message))
+    # --- MODERATION (Others Only) ---
+    # CRITICAL CHANGE: This now runs ONLY if you are NOT the owner.
+    # You bypass the toxicity filter completely.
+    if not is_owner:
+        asyncio.create_task(check_and_moderate(message))
     
-    # Clean message for command detection
     cleaned = CLEAN_TRIGGER_REGEX.sub('', message.content).strip().lower() if CLEAN_TRIGGER_REGEX else message.content.strip().lower()
 
-    # --- Owner Commands (work in all channels) ---
+    # --- OWNER COMMANDS & LOGIC ---
     if is_owner:
-        # Community mode commands
+        # 1. Background Command Router (The new "Split Brain" Logic)
+        # Checks if you ordered a ban/mute silently while Gemini chat proceeds below.
+        asyncio.create_task(process_owner_command_background(message))
+
+        # 2. Hardcoded Utility Commands
         if cleaned == "release":
             if not community_mode_active:
                 community_mode_active = True
@@ -1321,7 +1426,7 @@ async def on_message(message):
             
             await message.reply(response, mention_author=False)
             return
-        
+
         # View mod logs
         if cleaned in ["mod logs", "recent violations"]:
             logs = memory.get_moderation_logs(limit=10)
@@ -1334,8 +1439,10 @@ async def on_message(message):
             else:
                 await message.reply("No moderation logs yet!", mention_author=False)
             return
+
+    # --- MAIN CHAT LOGIC (FOREGROUND) ---
+    # This runs immediately for you. Gemini replies instantly.
     
-    # Determine if should respond
     is_mentioned = client.user.mentioned_in(message)
     if message.reference and message.reference.resolved:
         if message.reference.resolved.author == client.user:
@@ -1344,7 +1451,7 @@ async def on_message(message):
     
     should_respond, trigger_reason = should_naturally_respond(message, is_mentioned, contains_name, is_owner)
     
-    # In personal mode, only respond to owner
+    # Personal Mode Filtering
     if not community_mode_active and not is_owner:
         should_respond = False
     if not community_mode_active and is_owner and not (is_mentioned or contains_name):
@@ -1353,28 +1460,23 @@ async def on_message(message):
     if should_respond:
         async with message.channel.typing():
             try:
-                # Build rich context
                 context = build_rich_context(message, trigger_reason)
                 
-                messages = [
-                    {"role": "system", "content": CORE_PERSONALITY + "\n\n" + context}
-                ]
-                
-                messages.append({
-                    "role": "user", 
-                    "content": f"{message.author.display_name}: {message.content}"
-                })
+                messages = [{"role": "system", "content": CORE_PERSONALITY + "\n\n" + context}]
+                messages.append({"role": "user", "content": f"{message.author.display_name}: {message.content}"})
 
+                # Call Gemini (Main Persona)
                 response = await get_ai_response_with_tools(messages, str(message.author.id), str(message.channel.id))
                 
                 if response:
                     if trigger_reason == "random" or trigger_reason == "drama":
-                        sent_msg = await message.channel.send(response)
+                        await message.channel.send(response)
                     else:
-                        sent_msg = await message.reply(response, mention_author=False)
+                        await message.reply(response, mention_author=False)
 
             except Exception as e:
                 print(f"❌ Error: {e}")
+                # We can keep the traceback for easier debugging if something crashes
                 import traceback
                 traceback.print_exc()
                 if is_mentioned or contains_name:
