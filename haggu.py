@@ -163,6 +163,18 @@ def init_database():
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     
+    # --- Database Migrations ---
+    # Add missing columns to existing tables (for databases created before these columns existed)
+    try:
+        c.execute('ALTER TABLE user_profiles ADD COLUMN violation_count INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    try:
+        c.execute('ALTER TABLE user_profiles ADD COLUMN last_violation DATETIME')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
     conn.commit()
     conn.close()
     print("✓ Memory database initialized with moderation tables")
@@ -572,7 +584,7 @@ Response format (JSON only):
   "confidence": 0.0-1.0
 }}"""
 
-        response = await openrouter_client.chat.completions.create(
+        response = await detector_client.chat.completions.create(
             model=DETECTOR_MODEL,
             messages=[{"role": "user", "content": detector_prompt}],
             temperature=0.3,
@@ -628,7 +640,7 @@ Respond with JSON only:
   "reason": "why you chose this action"
 }}"""
 
-        response = await openrouter_client.chat.completions.create(
+        response = await chat_client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": decision_prompt}],
             temperature=0.5,
@@ -852,7 +864,8 @@ tools = [
 # --- Global State ---
 community_mode_active = False
 http_session = None
-openrouter_client = None
+chat_client = None  # Uses GEMINI_THREE key for chat_model
+detector_client = None  # Uses LALMA key for detector_model
 message_count_since_summary = 0
 SUMMARY_THRESHOLD = 100
 
@@ -960,7 +973,7 @@ async def get_ai_response_with_tools(messages_for_ai, current_user_id, channel_i
     """Generate AI response with tool support."""
     try:
         print(f"🧠 Thinking... (model: {CHAT_MODEL})")
-        response = await openrouter_client.chat.completions.create(
+        response = await chat_client.chat.completions.create(
             model=CHAT_MODEL,
             messages=messages_for_ai,
             tools=tools,
@@ -1018,7 +1031,7 @@ async def get_ai_response_with_tools(messages_for_ai, current_user_id, channel_i
                         "content": f"Error: {str(e)}"
                     })
 
-            second_response = await openrouter_client.chat.completions.create(
+            second_response = await chat_client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=messages_for_ai,
                 temperature=0.85,
@@ -1055,7 +1068,7 @@ async def summarize_recent_conversation(channel_id):
     participants = list(set([m['author_name'] for m in recent_msgs]))
     
     try:
-        summary_response = await openrouter_client.chat.completions.create(
+        summary_response = await chat_client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "Summarize this conversation in 2-3 sentences."},
@@ -1109,12 +1122,24 @@ def should_naturally_respond(message, is_mentioned, contains_name, is_owner):
     return False, None
 # --- Initialize Clients ---
 try:
-    if not DISCORD_TOKEN or not OPENROUTER_API_KEY:
-        raise ValueError("Missing API Keys!")
+    if not DISCORD_TOKEN:
+        raise ValueError("Missing DISCORD_BOT_TOKEN!")
+    if not GEMINI_THREE_KEY:
+        raise ValueError("Missing GEMINI_THREE key for chat model!")
+    if not LALMA_KEY:
+        raise ValueError("Missing LALMA key for detector model!")
 
-    openrouter_client = AsyncOpenAI(
+    # Chat client uses GEMINI_THREE key (for google/gemini-3-flash-preview)
+    chat_client = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
+        api_key=GEMINI_THREE_KEY,
+        timeout=30.0
+    )
+    
+    # Detector client uses LALMA key (for deepseek/deepseek-r1-distill-llama-70b)
+    detector_client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=LALMA_KEY,
         timeout=30.0
     )
 
