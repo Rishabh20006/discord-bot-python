@@ -25,12 +25,14 @@ MODEL_NAME = "google/gemini-3-flash-preview"
 BOT_NAME = "haggu"
 
 # Token pricing (per million tokens) - Update these based on current OpenRouter pricing
+# Token pricing (per million tokens) - Update these based on current OpenRouter pricing
 TOKEN_PRICING = {
     "google/gemini-3-flash-preview": {
-        "input": 0.075,   # $0.075 per 1M input tokens
-        "output": 0.30    # $0.30 per 1M output tokens
+        "input": 0.50,   # $0.50 per 1M input tokens
+        "output": 3.00   # $3.00 per 1M output tokens
     }
 }
+
 
 # --- Database Setup for Long-Term Memory ---
 DB_PATH = "haggu_memory.db"
