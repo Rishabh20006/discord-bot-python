@@ -24,6 +24,14 @@ OWNER_USERNAME = "rosehumai"
 MODEL_NAME = "google/gemini-3-flash-preview"
 BOT_NAME = "haggu"
 
+# Token pricing (per million tokens) - Update these based on current OpenRouter pricing
+TOKEN_PRICING = {
+    "google/gemini-3-flash-preview": {
+        "input": 0.075,   # $0.075 per 1M input tokens
+        "output": 0.30    # $0.30 per 1M output tokens
+    }
+}
+
 # --- Database Setup for Long-Term Memory ---
 DB_PATH = "haggu_memory.db"
 
@@ -78,6 +86,20 @@ def init_database():
         participants TEXT,
         start_time DATETIME,
         end_time DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # 🆕 Store token usage tracking
+    c.execute('''CREATE TABLE IF NOT EXISTS token_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        model TEXT,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        estimated_cost REAL DEFAULT 0.0,
+        request_type TEXT,
+        user_id TEXT,
+        channel_id TEXT
     )''')
     
     conn.commit()
@@ -255,6 +277,59 @@ class MemoryManager:
             return [dict(row) for row in c.fetchall()]
         finally:
             self.close()
+    
+    # 🆕 --- Token Usage Tracking ---
+    def log_token_usage(self, model, input_tokens, output_tokens, cost, request_type, user_id=None, channel_id=None):
+        """Log token usage for tracking and billing."""
+        c = self.connect()
+        try:
+            c.execute('''INSERT INTO token_usage 
+                        (model, input_tokens, output_tokens, total_tokens, estimated_cost, request_type, user_id, channel_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (model, input_tokens, output_tokens, input_tokens + output_tokens, cost, request_type, user_id, channel_id))
+            self.conn.commit()
+            print(f"💰 Logged: {input_tokens}in + {output_tokens}out = ${cost:.6f}")
+        except Exception as e:
+            print(f"Token logging error: {e}")
+        finally:
+            self.close()
+    
+    def get_token_stats(self, period='all'):
+        """Get token usage statistics."""
+        c = self.connect()
+        try:
+            if period == 'today':
+                c.execute('''SELECT SUM(input_tokens) as input, SUM(output_tokens) as output,
+                            SUM(total_tokens) as total, SUM(estimated_cost) as cost, COUNT(*) as requests
+                            FROM token_usage WHERE DATE(timestamp) = DATE('now')''')
+            elif period == 'week':
+                c.execute('''SELECT SUM(input_tokens) as input, SUM(output_tokens) as output,
+                            SUM(total_tokens) as total, SUM(estimated_cost) as cost, COUNT(*) as requests
+                            FROM token_usage WHERE timestamp >= datetime('now', '-7 days')''')
+            elif period == 'month':
+                c.execute('''SELECT SUM(input_tokens) as input, SUM(output_tokens) as output,
+                            SUM(total_tokens) as total, SUM(estimated_cost) as cost, COUNT(*) as requests
+                            FROM token_usage WHERE timestamp >= datetime('now', '-30 days')''')
+            else:  # all
+                c.execute('''SELECT SUM(input_tokens) as input, SUM(output_tokens) as output,
+                            SUM(total_tokens) as total, SUM(estimated_cost) as cost, COUNT(*) as requests
+                            FROM token_usage''')
+            
+            row = c.fetchone()
+            return dict(row) if row else None
+        finally:
+            self.close()
+    
+    def get_top_users_by_tokens(self, limit=5):
+        """Get users who've used the most tokens."""
+        c = self.connect()
+        try:
+            c.execute('''SELECT user_id, SUM(total_tokens) as tokens, SUM(estimated_cost) as cost
+                        FROM token_usage WHERE user_id IS NOT NULL
+                        GROUP BY user_id ORDER BY tokens DESC LIMIT ?''', (limit,))
+            return [dict(row) for row in c.fetchall()]
+        finally:
+            self.close()
 
 # Initialize memory
 init_database()
@@ -372,6 +447,16 @@ openrouter_client = None
 message_count_since_summary = 0
 SUMMARY_THRESHOLD = 100  # Summarize every 100 messages
 
+# 🆕 --- Token Cost Calculator ---
+def calculate_token_cost(model, input_tokens, output_tokens):
+    """Calculate cost based on token usage."""
+    if model in TOKEN_PRICING:
+        pricing = TOKEN_PRICING[model]
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        return input_cost + output_cost
+    return 0.0
+
 # --- Search Function ---
 async def serper_search_implementation(query: str, num_results: int = 3) -> str:
     """Async function to perform Google search using Serper API."""
@@ -482,8 +567,8 @@ def build_rich_context(message, trigger_reason):
     
     return context
 
-# --- AI Response Function ---
-async def get_ai_response_with_tools(messages_for_ai, current_user_id):
+# 🆕 --- AI Response Function (with token tracking) ---
+async def get_ai_response_with_tools(messages_for_ai, current_user_id, channel_id):
     """Generate AI response with tool support and memory."""
     try:
         print(f"🧠 Thinking... (model: {MODEL_NAME})")
@@ -497,6 +582,14 @@ async def get_ai_response_with_tools(messages_for_ai, current_user_id):
         )
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
+        
+        # 🆕 Extract and log token usage from first response
+        usage = response.usage
+        if usage:
+            input_tokens = usage.prompt_tokens
+            output_tokens = usage.completion_tokens
+            cost = calculate_token_cost(MODEL_NAME, input_tokens, output_tokens)
+            memory.log_token_usage(MODEL_NAME, input_tokens, output_tokens, cost, "chat", current_user_id, channel_id)
 
         if tool_calls:
             print(f"🔧 Using tools: {[call.function.name for call in tool_calls]}")
@@ -545,6 +638,15 @@ async def get_ai_response_with_tools(messages_for_ai, current_user_id):
                 temperature=0.85,
                 max_tokens=300
             )
+            
+            # 🆕 Log second response tokens too
+            usage2 = second_response.usage
+            if usage2:
+                input_tokens2 = usage2.prompt_tokens
+                output_tokens2 = usage2.completion_tokens
+                cost2 = calculate_token_cost(MODEL_NAME, input_tokens2, output_tokens2)
+                memory.log_token_usage(MODEL_NAME, input_tokens2, output_tokens2, cost2, "tool_followup", current_user_id, channel_id)
+            
             return second_response.choices[0].message.content.strip()
         
         return response_message.content.strip() if response_message.content else "..."
@@ -579,6 +681,12 @@ async def summarize_recent_conversation(channel_id):
             temperature=0.5,
             max_tokens=200
         )
+        
+        # 🆕 Log summary tokens
+        usage = summary_response.usage
+        if usage:
+            cost = calculate_token_cost(MODEL_NAME, usage.prompt_tokens, usage.completion_tokens)
+            memory.log_token_usage(MODEL_NAME, usage.prompt_tokens, usage.completion_tokens, cost, "summary", None, channel_id)
         
         summary = summary_response.choices[0].message.content.strip()
         memory.store_conversation_summary(channel_id, summary, "", ", ".join(participants))
@@ -687,7 +795,7 @@ async def on_message(message):
     # Clean message for command detection
     cleaned = CLEAN_TRIGGER_REGEX.sub('', message.content).strip().lower() if CLEAN_TRIGGER_REGEX else message.content.strip().lower()
 
-    # --- Mode Control (owner only) ---
+    # 🆕 --- Token Stats Commands (owner only) ---
     if is_owner:
         if cleaned == "release":
             if not community_mode_active:
@@ -704,6 +812,42 @@ async def on_message(message):
             users = memory.get_all_users_summary()
             recent = memory.get_recent_messages(message.channel.id, 10)
             await message.reply(f"👤 Know {len(users)} users\n💬 Stored {len(recent)}+ recent msgs\n🧠 Memory: Active", mention_author=False)
+            return
+        
+        # 🆕 Token stats commands
+        if cleaned in ["token stats", "tokens", "usage"]:
+            stats_today = memory.get_token_stats('today')
+            stats_all = memory.get_token_stats('all')
+            
+            response = "**💰 Token Usage Stats**\n\n"
+            if stats_today and stats_today['total']:
+                response += f"**Today:**\n"
+                response += f"• Requests: {stats_today['requests']}\n"
+                response += f"• Input: {stats_today['input']:,} tokens\n"
+                response += f"• Output: {stats_today['output']:,} tokens\n"
+                response += f"• Cost: ${stats_today['cost']:.4f}\n\n"
+            else:
+                response += "**Today:** No usage yet\n\n"
+            
+            if stats_all and stats_all['total']:
+                response += f"**All Time:**\n"
+                response += f"• Requests: {stats_all['requests']}\n"
+                response += f"• Total: {stats_all['total']:,} tokens\n"
+                response += f"• Cost: ${stats_all['cost']:.4f}"
+            
+            await message.reply(response, mention_author=False)
+            return
+        
+        if cleaned in ["token breakdown", "who's using"]:
+            top_users = memory.get_top_users_by_tokens(5)
+            if top_users:
+                response = "**👥 Top Token Users:**\n"
+                for idx, user_data in enumerate(top_users, 1):
+                    user = await client.fetch_user(int(user_data['user_id']))
+                    response += f"{idx}. {user.display_name}: {user_data['tokens']:,} tokens (${user_data['cost']:.4f})\n"
+                await message.reply(response, mention_author=False)
+            else:
+                await message.reply("No token usage data yet!", mention_author=False)
             return
 
     # --- Determine if should respond ---
@@ -737,7 +881,8 @@ async def on_message(message):
                     "content": f"{message.author.display_name}: {message.content}"
                 })
 
-                response = await get_ai_response_with_tools(messages, str(message.author.id))
+                # 🆕 Pass channel_id for token tracking
+                response = await get_ai_response_with_tools(messages, str(message.author.id), str(message.channel.id))
                 
                 if response:
                     # Store our response too
@@ -763,3 +908,5 @@ if __name__ == "__main__":
         print(f"❌ Run Error: {e}")
 
 # autopush-test
+
+# autosave-test: 1766069034
