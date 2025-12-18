@@ -560,11 +560,12 @@ def fast_pattern_check(message):
     return violations
 
 
-# --- TIER 1: AI Detection (DeepSeek) ---
+# --- TIER 1: AI Detection (DeepSeek - Final Fix) ---
 async def ai_content_analysis(message):
-    """Use DeepSeek AI to analyze message for violations."""
+    """Use DeepSeek AI to analyze message (Robust + Auto-Repair)."""
     try:
-        detector_prompt = f"""Analyze this Discord message for rule violations. Respond ONLY with valid JSON.
+        detector_prompt = f"""Analyze this Discord message for rule violations. 
+Respond ONLY with raw JSON. Do not use Markdown code blocks.
 
 Message from {message.author.display_name}: "{message.content}"
 
@@ -587,8 +588,8 @@ Response format (JSON only):
         response = await detector_client.chat.completions.create(
             model=DETECTOR_MODEL,
             messages=[{"role": "user", "content": detector_prompt}],
-            temperature=0.3,
-            max_tokens=150
+            temperature=0.1,
+            max_tokens=600  # <--- INCREASED TO PREVENT CUTOFF
         )
         
         # Log token usage
@@ -598,16 +599,46 @@ Response format (JSON only):
             memory.log_token_usage(DETECTOR_MODEL, usage.prompt_tokens, usage.completion_tokens, 
                                   cost, "detection", str(message.author.id), str(message.channel.id))
         
-        # Parse response
+        # --- ROBUST PARSING LOGIC ---
         result_text = response.choices[0].message.content.strip()
-        result_text = re.sub(r'``````', '', result_text)
-        result = json.loads(result_text)
+        print(f"📝 Raw AI Output: {result_text}") 
+
+        # 1. Remove <think> tags
+        result_text = re.sub(r'<think>.*?</think>', '', result_text, flags=re.DOTALL)
         
-        print(f"🔍 AI Detection: {result}")
-        return result if result.get("violation") else None
+        # 2. Remove Markdown (```json ... ```)
+        result_text = result_text.replace('```json', '').replace('```', '').strip()
+
+        # 3. Find start of JSON
+        start_idx = result_text.find('{')
+        if start_idx == -1:
+            print("❌ No JSON start bracket found")
+            return None
+            
+        # 4. Find end of JSON (or try to repair if cut off)
+        end_idx = result_text.rfind('}')
+        
+        if end_idx == -1:
+            # JSON might be cut off. Let's try to append a closing brace and see if it works.
+            print("⚠️ JSON might be truncated. Attempting repair...")
+            json_str = result_text[start_idx:] + '}'
+        else:
+            json_str = result_text[start_idx:end_idx+1]
+
+        # 5. Parse
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # Last ditch effort: Python literal eval (handles single quotes, etc)
+            try:
+                import ast
+                return ast.literal_eval(json_str)
+            except:
+                print("❌ parsing failed completely.")
+                return None
         
     except Exception as e:
-        print(f"❌ AI Detection Error: {e}")
+        print(f"❌ AI Analysis Error: {e}")
         return None
 
 
@@ -719,47 +750,61 @@ async def execute_moderation(message, violation_info, decision):
 
 # --- Main Moderation Pipeline ---
 async def check_and_moderate(message):
-    """Main moderation pipeline: Fast check → AI detection → Smart action."""
+    """Main moderation pipeline: Fast check → AI detection (ALWAYS) → Smart action."""
     
     # Skip if user is whitelisted
     if str(message.author.id) in MODERATION_RULES['whitelist']:
         return
     
-    # TIER 0: Fast pattern check (instant, free)
+    # --- TIER 0: Fast pattern check (instant, free) ---
     fast_violations = fast_pattern_check(message)
     
     if fast_violations:
-        # Use first violation found
         violation = fast_violations[0]
-        print(f"⚡ Fast detection: {violation['type']}")
+        print(f"⚡ Fast detection triggered: {violation['type']}")
         
-        # For high severity, use AI to decide action
+        # High severity -> Let Gemini decide punishment
         if violation['severity'] in ['medium', 'high']:
             decision = await decide_moderation_action(message, violation)
             await execute_moderation(message, violation, decision)
+        
+        # Low severity (Spam) -> Auto-delete immediately
         else:
-            # Low severity: auto-delete spam
             if violation['type'] in ['spam', 'repeat_spam']:
                 await message.delete()
+                # I put this logging back in!
                 memory.log_moderation_action(
                     message.author.id, message.author.display_name, message.channel.id,
                     violation['type'], violation['severity'], message.content, "delete", "Auto-delete spam"
                 )
         return
+
+    # --- TIER 1: AI content analysis (DeepSeek Llama) ---
+    # Now runs on ALL messages that passed the fast check
+    print(f"🤔 Sending '{message.content}' to AI for scanning...") # Debug print
     
-    # TIER 1: AI content analysis (if fast check passes)
-    # Only run AI on messages that pass fast checks (saves money)
-    # You can adjust this - maybe run AI randomly on 10% of messages
-    if random.random() < 0.10:  # 10% of messages get AI scanned
-        ai_result = await ai_content_analysis(message)
-        if ai_result and ai_result.get('confidence', 0) > 0.7:  # High confidence violations
+    ai_result = await ai_content_analysis(message)
+    
+    if ai_result:
+        confidence = ai_result.get('confidence', 0)
+        is_violation = ai_result.get('violation', False)
+        print(f"🧐 AI Verdict: Violation={is_violation}, Confidence={confidence}") # Debug print
+
+        # Check if it meets the threshold (0.6 is a good balance)
+        if is_violation and confidence > 0.6:
+            print("🚨 Threshold met! Taking action.")
             violation = {
                 "type": ai_result['type'],
                 "severity": ai_result['severity'],
                 "reason": ai_result['reason']
             }
             decision = await decide_moderation_action(message, violation)
-            await execute_moderation(message, violation, decision)            
+            await execute_moderation(message, violation, decision)
+        else:
+            print("📉 Ignored: Confidence too low or no violation found.")
+    else:
+        print("❌ AI Analysis failed (returned None).") 
+    
 # --- Personality Prompts ---
 CORE_PERSONALITY = """You are haggu, a real member of this Discord server - Rose's best friend who's been here since day one.
 
